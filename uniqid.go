@@ -1,123 +1,229 @@
+// Package tsuniqid provides a high-performance unique ID generator
+// that generates both string and uint64 type unique identifiers.
+//
+// The generated IDs are composed of:
+// - Machine ID (8 bits): Unique identifier for the machine/process
+// - Timestamp (42 bits): Current Unix timestamp in milliseconds
+// - Counter (14 bits): Atomic counter to ensure uniqueness within the same millisecond
+// - Random suffix (for string IDs): Additional randomness for string-based IDs
 package tsuniqid
 
 import (
-	"bytes"
-	"crypto/rand"
 	"crypto/sha1"
 	"encoding/binary"
-	"encoding/hex"
 	"fmt"
-	"math"
-	"math/big"
-	simpleRand "math/rand"
+	"math/rand"
 	"os"
 	"strconv"
-	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
 
-var (
-	generator = NewUniqIDGenerator()
-)
-
-func UniqID() string {
-	return generator.uniqID()
-}
-
-func UniqUID() uint64 {
-	return generator.nextID()
-}
-
+// Bit allocation constants for the unique ID generation
 const (
-	maxMachineNum = 0xff
-	maxCounterNum = 0x3fff
-	maxTimestamp  = 0x3ffffffffff
+	// MaxMachineID represents the maximum machine ID value (4 bits)
+	MaxMachineID = 0xf
+
+	// MaxInstanceID represents the maximum instance ID value (4 bits)
+	MaxInstanceID = 0xf
+
+	// MaxCounter represents the maximum counter value (14 bits)
+	MaxCounter = 0x3fff
+
+	// MaxTimestamp represents the maximum timestamp value (42 bits)
+	MaxTimestamp = 0x3ffffffffff
+
+	// RandomSuffixLength is the length of random suffix for string IDs
+	RandomSuffixLength = 8
+
+	// CharSet contains characters used for random string generation
+	CharSet = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+	// TimestampShift is the number of bits to shift timestamp
+	TimestampShift = 14
+
+	// InstanceIDShift is the number of bits to shift instance ID
+	InstanceIDShift = 56
+
+	// MachineIDShift is the number of bits to shift machine ID
+	MachineIDShift = 60
 )
 
-type UniqIDGenerator struct {
-	machineID uint64
-	counter   uint64
+// globalInstanceCounter is used to assign unique instance IDs to each generator
+var globalInstanceCounter uint64
+
+// Generator is the default global generator instance
+var Generator = NewGenerator()
+
+// UniqID generates a unique string ID using the default generator.
+// The string ID consists of a hex-encoded uint64 ID plus a random suffix.
+//
+// Returns: A unique string identifier
+func UniqID() string {
+	return Generator.GenerateStringID()
 }
 
-func NewUniqIDGenerator() *UniqIDGenerator {
-	return &UniqIDGenerator{
-		machineID: initMachineID() % maxMachineNum,
+// UniqUID generates a unique uint64 ID using the default generator.
+// The uint64 ID is composed of machine ID, timestamp, and counter.
+//
+// Returns: A unique uint64 identifier
+func UniqUID() uint64 {
+	return Generator.GenerateUint64ID()
+}
+
+// IDGenerator is responsible for generating unique identifiers.
+// It maintains machine ID, instance ID and an atomic counter to ensure uniqueness.
+type IDGenerator struct {
+	machineID  uint64     // 4-bit machine identifier
+	instanceID uint64     // 4-bit instance identifier for distinguishing multiple generators
+	counter    uint64     // atomic counter for uniqueness within the same millisecond
+	rng        *rand.Rand // local random number generator for better performance
+	mu         sync.Mutex // mutex to protect rng from concurrent access
+}
+
+// NewGenerator creates a new IDGenerator instance with initialized machine ID and unique instance ID.
+//
+// Returns: A new IDGenerator instance
+func NewGenerator() *IDGenerator {
+	// Initialize with current time as seed for better randomness
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	// Assign a unique instance ID to this generator
+	instanceID := atomic.AddUint64(&globalInstanceCounter, 1) & MaxInstanceID
+
+	return &IDGenerator{
+		machineID:  generateMachineID() & MaxMachineID, // Ensure within 6-bit range
+		instanceID: instanceID,                         // Ensure within 2-bit range
+		counter:    0,
+		rng:        rng,
 	}
 }
 
-func (i *UniqIDGenerator) uniqID() string {
-	return fmt.Sprintf("%s%s", strconv.FormatUint(i.nextID(), 16), randString(8))
+// GenerateStringID creates a unique string identifier.
+// Format: hex(uint64_id) + random_suffix
+//
+// Returns: A unique string identifier
+func (g *IDGenerator) GenerateStringID() string {
+	id := g.GenerateUint64ID()
+	suffix := g.generateRandomSuffix(RandomSuffixLength)
+	return fmt.Sprintf("%s%s", strconv.FormatUint(id, 16), suffix)
 }
 
-func (i *UniqIDGenerator) nextID() uint64 {
-	nextCounter := i.nextCounter()
+// GenerateUint64ID creates a unique uint64 identifier.
+//
+// Bit layout (64 bits total):
+// - Bits 63-60 (4 bits): Machine ID
+// - Bits 59-56 (4 bits): Instance ID
+// - Bits 55-14 (42 bits): Timestamp (milliseconds since Unix epoch)
+// - Bits 13-0 (14 bits): Counter
+//
+// Returns: A unique uint64 identifier
+func (g *IDGenerator) GenerateUint64ID() uint64 {
+	counter := g.nextCounter()
 	timestamp := uint64(time.Now().UnixMilli())
-	id := (i.machineID << 56) | (timestamp % maxTimestamp << 14) | (nextCounter % maxCounterNum)
+
+	// Combine components with bit shifting
+	id := (g.machineID << MachineIDShift) |
+		(g.instanceID << InstanceIDShift) |
+		((timestamp & MaxTimestamp) << TimestampShift) |
+		(counter & MaxCounter)
+
 	return id
 }
 
-func (i *UniqIDGenerator) nextCounter() uint64 {
-	return atomic.AddUint64(&i.counter, 1)
+// nextCounter atomically increments and returns the next counter value.
+//
+// Returns: The next counter value
+func (g *IDGenerator) nextCounter() uint64 {
+	return atomic.AddUint64(&g.counter, 1)
 }
 
-func initMachineID() uint64 {
-	var (
-		machineID uint64
-		host      string
-		ip        string
-		err       error
-	)
-
-	host, err = os.Hostname()
-	if err != nil || host == "" {
-		host = randString(10)
+// generateRandomSuffix creates a random string of specified length.
+// Uses a more efficient approach than crypto/rand for non-cryptographic purposes.
+// This method is thread-safe.
+//
+// Parameters:
+//   - length: The desired length of the random string
+//
+// Returns: A random string of the specified length
+func (g *IDGenerator) generateRandomSuffix(length int) string {
+	if length <= 0 {
+		return ""
 	}
 
-	locIP, err := getLocalIP()
+	result := make([]byte, length)
+	charSetLen := len(CharSet)
+
+	// Lock to ensure thread-safe access to the random number generator
+	g.mu.Lock()
+	for i := 0; i < length; i++ {
+		result[i] = CharSet[g.rng.Intn(charSetLen)]
+	}
+	g.mu.Unlock()
+
+	return string(result)
+}
+
+// generateMachineID creates a unique machine identifier based on hostname and local IP.
+// If hostname or IP cannot be obtained, it falls back to random generation.
+//
+// Returns: A machine-specific identifier
+func generateMachineID() uint64 {
+	// Get hostname
+	hostname, err := os.Hostname()
+	if err != nil || hostname == "" {
+		hostname = generateFallbackString(10)
+	}
+
+	// Get local IP
+	localIP, err := getLocalIP()
+	var ipStr string
 	if err != nil {
-		ip = randString(10)
+		ipStr = generateFallbackString(10)
 	} else {
-		ip = locIP.String()
+		ipStr = localIP.String()
 	}
 
-	machineBytes := []byte(hashSha1(host + ip))
-	machineBytes = machineBytes[len(machineBytes)-8:]
-	_ = binary.Read(bytes.NewBuffer(machineBytes), binary.BigEndian, &machineID)
-
-	if machineID == 0 {
-		machineID = randUint64()
-	}
-	return machineID
+	// Create machine ID from hostname and IP
+	return hashToUint64(hostname + ipStr)
 }
 
-var (
-	newSimpleRand = simpleRand.New(simpleRand.NewSource(time.Now().UnixNano()))
-	letters       = "1234567890abcde"
-	lettersLen    = 15
-)
+// hashToUint64 converts a string to uint64 using SHA1 hash.
+//
+// Parameters:
+//   - input: The string to hash
+//
+// Returns: A uint64 representation of the hash
+func hashToUint64(input string) uint64 {
+	hasher := sha1.New()
+	hasher.Write([]byte(input))
+	hashBytes := hasher.Sum(nil)
 
-func randString(len int) string {
-	var s []string
-	b := new(big.Int).SetInt64(int64(lettersLen))
-	for i := 0; i < len; i++ {
-		if i, err := rand.Int(rand.Reader, b); err == nil {
-			s = append(s, string(letters[i.Int64()]))
-		}
+	// Use the last 8 bytes of the hash for uint64 conversion
+	if len(hashBytes) >= 8 {
+		return binary.BigEndian.Uint64(hashBytes[len(hashBytes)-8:])
 	}
-	return strings.Join(s, "")
+
+	// Fallback: pad with zeros if hash is somehow shorter
+	padded := make([]byte, 8)
+	copy(padded[8-len(hashBytes):], hashBytes)
+	return binary.BigEndian.Uint64(padded)
 }
 
-func randUint64() uint64 {
-	r, err := rand.Int(rand.Reader, new(big.Int).SetUint64(math.MaxUint64))
-	if err != nil {
-		return newSimpleRand.Uint64()
-	}
-	return r.Uint64()
-}
+// generateFallbackString creates a random string for fallback purposes.
+//
+// Parameters:
+//   - length: The desired length of the random string
+//
+// Returns: A random string of the specified length
+func generateFallbackString(length int) string {
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	result := make([]byte, length)
 
-func hashSha1(s string) string {
-	h := sha1.New()
-	h.Write([]byte(s))
-	return hex.EncodeToString(h.Sum(nil))
+	for i := 0; i < length; i++ {
+		result[i] = CharSet[rng.Intn(len(CharSet))]
+	}
+
+	return string(result)
 }
