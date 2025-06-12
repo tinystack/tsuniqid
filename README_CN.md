@@ -1,6 +1,6 @@
 # tsuniqid
 
-[![English](https://img.shields.io/badge/English-blue)](README.md) [![中文](https://img.shields.io/badge/中文-red)](README_CN.md)
+[English](./README.md) | [中文文档](./README_CN.md)
 
 一个高性能的 Go 语言唯一 ID 生成器，提供字符串和 uint64 类型的唯一标识符，具有出色的并发安全性和性能特征。
 
