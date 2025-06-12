@@ -1,6 +1,6 @@
 # tsuniqid
 
-[![English](https://img.shields.io/badge/English-blue)](README.md) [![中文](https://img.shields.io/badge/中文-red)](README_CN.md)
+[English](./README.md) | [中文文档](./README_CN.md)
 
 A high-performance unique ID generator for Go that provides both string and uint64 type unique identifiers with excellent concurrency safety and performance characteristics.
 
